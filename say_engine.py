@@ -213,7 +213,12 @@ def handle_say(raw_args: str | None) -> str:
     """Plugin slash-command body: `/say ...` → human-readable result line."""
     arg = (raw_args or "").strip()
     if arg.lower() == "stop":
-        return "stopped." if stop() else "nothing playing."
+        silenced = stop()
+        try:
+            set_mode("once")
+        except Exception:
+            pass
+        return "stopped." if silenced else "nothing playing."
     if arg.lower() in MODES:
         # Seen only when the TUI tree patch is gone (it intercepts these words
         # while present): save the preference into the shared mode file so auto

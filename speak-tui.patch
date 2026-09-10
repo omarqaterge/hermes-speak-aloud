@@ -1,9 +1,9 @@
 diff --git a/tests/tui_gateway/test_speak_aloud.py b/tests/tui_gateway/test_speak_aloud.py
 new file mode 100644
-index 0000000000..00eecb2e7d
+index 0000000000..d2ac623bd1
 --- /dev/null
 +++ b/tests/tui_gateway/test_speak_aloud.py
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,230 @@
 +"""Apple-native read-aloud for fullscreen TUI mode (`speak.*` RPC).
 +
 +macOS Speak Selection (Option+Esc) reads AXSelectedText, which terminal
@@ -161,6 +161,40 @@ index 0000000000..00eecb2e7d
 +    server._methods["speak.mode"](14, {"mode": "once"})
 +
 +
++def test_speak_stop_disarms_always_mode(tmp_path, monkeypatch):
++    from tui_gateway import server
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    m._say_stop_all()
++    server._methods["speak.mode"](15, {"mode": "always"})
++    assert server._methods["speak.status"](16, {})["result"]["mode"] == "always"
++    result = server._methods["speak.stop"](17, {})
++    assert result["result"]["stopped"] is False
++    assert result["result"]["auto_was_on"] is True
++    assert result["result"]["mode"] == "once"
++    assert server._methods["speak.status"](18, {})["result"]["mode"] == "once"
++
++
++@pytest.mark.macos_only
++def test_speak_stop_reports_auto_was_on_while_playing(monkeypatch, tmp_path):
++    from tui_gateway import server
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    _FakePopen.instances.clear()
++    monkeypatch.setattr(m.subprocess, "Popen", _FakePopen)
++    status = server._methods["speak.status"]
++    # NOTE: start AND stop both go through the bound table — unbound
++    # `m._say_*` calls touch a different module global once rebound.
++    server._methods["speak.mode"](19, {"mode": "always"})
++    say_res = server._methods["speak.say"](19, {"text": "talking"})
++    assert say_res["result"]["status"] == "speaking"
++    result = server._methods["speak.stop"](20, {})
++    assert result["result"]["stopped"] is True
++    assert result["result"]["auto_was_on"] is True
++    assert result["result"]["mode"] == "once"
++    assert status(21, {})["result"]["speaking"] is False
++
++
 +def _say_items(text):
 +    from tui_gateway import methods_complete_helpers as h
 +
@@ -169,9 +203,10 @@ index 0000000000..00eecb2e7d
 +    return h._say_completions(text)
 +
 +
-+def test_say_completions_list_options_on_bare_command():
-+    texts = [i["text"] for i in _say_items("/say")]
-+    assert texts == [" stop", " always", " once"]
++def test_say_completions_leave_bare_command_alone():
++    # Exact `/say` (no space) must keep completing to `/say` itself —
++    # offering options here hijacks Enter into the first one.
++    assert _say_items("/say") is None
 +
 +
 +def test_say_completions_list_options_after_space():
@@ -213,10 +248,10 @@ index a7e5decc11..4674342351 100644
  
  
 diff --git a/tui_gateway/methods_complete_helpers.py b/tui_gateway/methods_complete_helpers.py
-index b4ea31533a..001721ffc4 100644
+index b4ea31533a..9f736a5ced 100644
 --- a/tui_gateway/methods_complete_helpers.py
 +++ b/tui_gateway/methods_complete_helpers.py
-@@ -162,6 +162,32 @@ def _details_completions(text: str) -> list[dict] | None:
+@@ -162,6 +162,36 @@ def _details_completions(text: str) -> list[dict] | None:
      return []
  
  
@@ -237,9 +272,13 @@ index b4ea31533a..001721ffc4 100644
 +    body = text[len("/say") :].removeprefix(" ")
 +    parts = body.split()
 +    trailing = text.endswith(" ")
-+    if not body or (not parts and trailing):
-+        lead = "" if trailing else " "
-+        return [_item(f"{lead}{c}", meta) for c, meta in _SAY_OPTIONS]
++    if not parts and trailing:
++        # Bare `/say ` — offer the subcommands. Exact `/say` (no space)
++        # returns None so normal completion keeps offering `/say` itself;
++        # replacing it would hijack Enter into the first option.
++        return [_item(c, meta) for c, meta in _SAY_OPTIONS]
++    if not body:
++        return None
 +    if len(parts) == 1 and not trailing:
 +        prefix = parts[0].lower()
 +        return [_item(c, meta) for c, meta in _SAY_OPTIONS if c.startswith(prefix) and c != prefix]
@@ -250,7 +289,7 @@ index b4ea31533a..001721ffc4 100644
      """Layer live session state onto config without losing custom identity."""
      from hermes_cli.inventory import load_picker_context
 diff --git a/tui_gateway/methods_voice.py b/tui_gateway/methods_voice.py
-index d13a6c3c85..f14224e9f8 100644
+index d13a6c3c85..c74f5649b0 100644
 --- a/tui_gateway/methods_voice.py
 +++ b/tui_gateway/methods_voice.py
 @@ -5,6 +5,9 @@ per process). Bodies are rebound onto server.py's globals (method_ctx.bind_modul
@@ -263,7 +302,7 @@ index d13a6c3c85..f14224e9f8 100644
  import threading
  
  from .method_ctx import HandlerRegistry, bind_module
-@@ -775,5 +778,218 @@ def _(rid, params: dict) -> dict:
+@@ -775,5 +778,225 @@ def _(rid, params: dict) -> dict:
      return _ok(rid, {"status": "speaking"})
  
  
@@ -416,8 +455,15 @@ index d13a6c3c85..f14224e9f8 100644
 +
 +@method("speak.stop")
 +def _(rid, params: dict) -> dict:
++    auto_was_on = _say_get_mode() == "always"
 +    stopped = _say_stop_all()
-+    return _ok(rid, {"status": "stopped", "stopped": stopped})
++    # Stopping means silence, period — a lingering `always` would speak the
++    # very next reply. Persisting `once` never fails the stop itself.
++    try:
++        mode, _ = _say_set_mode("once")
++    except Exception:
++        mode = _say_get_mode()
++    return _ok(rid, {"status": "stopped", "stopped": stopped, "auto_was_on": auto_was_on, "mode": mode})
 +
 +
 +_SAY_MODE_FILE = "speak-aloud.mode"
@@ -482,6 +528,26 @@ index d13a6c3c85..f14224e9f8 100644
 +
  def register(server) -> None:
      bind_module(globals(), server, skip=("_",))
+diff --git a/ui-tui/src/__tests__/completionApply.test.ts b/ui-tui/src/__tests__/completionApply.test.ts
+index b8870a9427..d6a51531c5 100644
+--- a/ui-tui/src/__tests__/completionApply.test.ts
++++ b/ui-tui/src/__tests__/completionApply.test.ts
+@@ -60,4 +60,15 @@ describe('completionToApplyOnSubmit', () => {
+     expect(completionToApplyOnSubmit('/exit', undefined, 1)).toBeNull()
+     expect(completionToApplyOnSubmit('/exit', '', 1)).toBeNull()
+   })
++
++  it('submits bare /say instead of jumping into its options', () => {
++    // The gateway offers `say ` (trailing space) for exact `/say`; that adds
++    // nothing, so Enter must submit (speak last reply), not accept.
++    expect(completionToApplyOnSubmit('/say', 'say ', 1)).toBeNull()
++  })
++
++  it('accepts a /say option as a real argument completion', () => {
++    expect(completionToApplyOnSubmit('/say ', 'stop', 5)).toBe('/say stop')
++    expect(completionToApplyOnSubmit('/say a', 'always', 5)).toBe('/say always')
++  })
+ })
 diff --git a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts b/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
 index b6df3a23e9..8e03f05f35 100644
 --- a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
@@ -530,10 +596,10 @@ index b6df3a23e9..8e03f05f35 100644
      const appended: Msg[] = []
      const todos = [{ content: 'Boil water', id: 'boil', status: 'in_progress' }]
 diff --git a/ui-tui/src/__tests__/createSlashHandler.test.ts b/ui-tui/src/__tests__/createSlashHandler.test.ts
-index 67f2609f91..c4e7c51d13 100644
+index 67f2609f91..f0e4c75d45 100644
 --- a/ui-tui/src/__tests__/createSlashHandler.test.ts
 +++ b/ui-tui/src/__tests__/createSlashHandler.test.ts
-@@ -1136,6 +1136,82 @@ describe('createSlashHandler', () => {
+@@ -1136,6 +1136,92 @@ describe('createSlashHandler', () => {
        expect(ctx.transcript.sys).toHaveBeenCalledWith('title: demo title')
      })
    })
@@ -589,6 +655,16 @@ index 67f2609f91..c4e7c51d13 100644
 +    expect(rpc).toHaveBeenCalledWith('speak.stop', {})
 +    await vi.waitFor(() => {
 +      expect(ctx.transcript.sys).toHaveBeenCalledWith('stopped.')
++    })
++  })
++
++  it('/say stop reports auto read-aloud switching off', async () => {
++    const rpc = vi.fn(() => Promise.resolve({ auto_was_on: true, mode: 'once', status: 'stopped', stopped: true }))
++    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
++
++    expect(createSlashHandler(ctx)('/say stop')).toBe(true)
++    await vi.waitFor(() => {
++      expect(ctx.transcript.sys).toHaveBeenCalledWith('stopped. Auto read-aloud OFF.')
 +    })
 +  })
 +
@@ -689,7 +765,7 @@ index b0a4059d6d..c1a741bc68 100644
            flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')
  
 diff --git a/ui-tui/src/app/slash/commands/core.ts b/ui-tui/src/app/slash/commands/core.ts
-index 794457a168..b6a9c3c181 100644
+index 794457a168..d31c74d4f6 100644
 --- a/ui-tui/src/app/slash/commands/core.ts
 +++ b/ui-tui/src/app/slash/commands/core.ts
 @@ -12,6 +12,9 @@ import type {
@@ -702,7 +778,7 @@ index 794457a168..b6a9c3c181 100644
    SystemBatteryResponse
  } from '../../../gatewayTypes.js'
  import { writeClipboardText } from '../../../lib/clipboard.js'
-@@ -437,6 +440,90 @@ export const coreCommands: SlashCommand[] = [
+@@ -437,6 +440,91 @@ export const coreCommands: SlashCommand[] = [
      }
    },
  
@@ -718,7 +794,8 @@ index 794457a168..b6a9c3c181 100644
 +          .rpc<SpeakStopResponse>('speak.stop', {})
 +          .then(
 +            ctx.guarded<SpeakStopResponse>(r => {
-+              sys(r.stopped ? 'stopped.' : 'nothing playing.')
++              const main = r.stopped ? 'stopped.' : 'nothing playing.'
++              sys(r.auto_was_on ? `${main} Auto read-aloud OFF.` : main)
 +            })
 +          )
 +          .catch(ctx.guardedErr)
@@ -794,7 +871,7 @@ index 794457a168..b6a9c3c181 100644
      help: 'attach clipboard image',
      name: 'paste',
 diff --git a/ui-tui/src/app/useInputHandlers.ts b/ui-tui/src/app/useInputHandlers.ts
-index 222d50cdaf..c8b8bd4ebe 100644
+index 222d50cdaf..12981eb84a 100644
 --- a/ui-tui/src/app/useInputHandlers.ts
 +++ b/ui-tui/src/app/useInputHandlers.ts
 @@ -9,10 +9,13 @@ import type {
@@ -812,7 +889,7 @@ index 222d50cdaf..c8b8bd4ebe 100644
  import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionWheel.js'
  import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
  import { closeWidget, dispatchWidgetInput } from '../sdk/host.js'
-@@ -360,6 +363,63 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
+@@ -360,6 +363,64 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
        })
    }
  
@@ -831,7 +908,8 @@ index 222d50cdaf..c8b8bd4ebe 100644
 +        if (status.speaking) {
 +          gateway.rpc<SpeakStopResponse>('speak.stop', {}).then(r => {
 +            if (r) {
-+              actions.sys(r.stopped ? 'stopped.' : 'nothing playing.')
++              const main = r.stopped ? 'stopped.' : 'nothing playing.'
++              actions.sys(r.auto_was_on ? `${main} Auto read-aloud OFF.` : main)
 +            }
 +          })
 +
@@ -876,7 +954,7 @@ index 222d50cdaf..c8b8bd4ebe 100644
    // Double-Esc discards the draft, matching Claude Code / Gemini CLI. It
    // sits above the isBlocked early-return so a prompt overlay cannot swallow
    // it. Ctrl+C now clears a non-empty composer even mid-stream; Esc Esc is
-@@ -685,6 +745,12 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
+@@ -685,6 +746,12 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
        return voiceRecordToggle()
      }
  
@@ -902,10 +980,10 @@ index 37f21f6c13..af27e40355 100644
    [action + '+Z / ' + action + '+Y', 'undo / redo input edits'],
    [action + '+W', 'delete word'],
 diff --git a/ui-tui/src/gatewayTypes.ts b/ui-tui/src/gatewayTypes.ts
-index 212bfbf8f1..ed09f3c1bd 100644
+index 212bfbf8f1..68ea5807b2 100644
 --- a/ui-tui/src/gatewayTypes.ts
 +++ b/ui-tui/src/gatewayTypes.ts
-@@ -427,6 +427,31 @@ export interface VoiceRecordResponse {
+@@ -427,6 +427,33 @@ export interface VoiceRecordResponse {
    text?: string
  }
  
@@ -917,6 +995,8 @@ index 212bfbf8f1..ed09f3c1bd 100644
 +}
 +
 +export interface SpeakStopResponse {
++  auto_was_on?: boolean
++  mode?: string
 +  status?: string
 +  stopped?: boolean
 +}
@@ -965,14 +1045,14 @@ index 60f6758684..bcbad3863e 100644
   * Voice recording toggle key — configurable via ``voice.record_key`` in
   * ``config.yaml`` (default ``ctrl+b``).
 diff --git a/website/docs/reference/slash-commands.md b/website/docs/reference/slash-commands.md
-index 0bcdcb52cb..2f71d98fc9 100644
+index 0bcdcb52cb..ac2ac7f015 100644
 --- a/website/docs/reference/slash-commands.md
 +++ b/website/docs/reference/slash-commands.md
 @@ -138,6 +138,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
  | `/platforms` (alias: `/gateway`) | Show gateway/messaging platform status (CLI-only summary view). |
  | `/paste` | Attach a clipboard image |
  | `/copy [number]` | Copy the last assistant response to clipboard (or the Nth-from-last with a number). CLI-only. |
-+| `/say [text\|number\|stop\|always\|once]` | Read aloud with the Apple system voice (macOS, no API key): bare `/say` speaks the last reply, `/say 2` the 2nd-from-last, `/say <text>` literal text, `/say stop` stops, `/say always` speaks every future reply automatically, `/say once` back to on-demand. Also **Ctrl+S** (highlight first). macOS Speak Selection (Option+Esc) can't work inside fullscreen terminal apps, so this replaces it. |
++| `/say [text\|number\|stop\|always\|once]` | Read aloud with the Apple system voice (macOS, no API key): bare `/say` speaks the last reply, `/say 2` the 2nd-from-last, `/say <text>` literal text, `/say stop` stops and turns auto off, `/say always` speaks every future reply automatically, `/say once` back to on-demand. Also **Ctrl+S** (highlight first). macOS Speak Selection (Option+Esc) can't work inside fullscreen terminal apps, so this replaces it. |
  | `/image <path>` | Attach a local image file for your next prompt. |
  | `/debug` | Upload debug report (system info + logs) and get shareable links. Also available in messaging. |
  | `/update` | Update Hermes Agent to the latest version. |

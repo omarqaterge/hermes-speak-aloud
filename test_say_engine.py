@@ -106,6 +106,16 @@ def test_handle_say_stop_idle():
     assert handle_say("stop") == "nothing playing."
 
 
+def test_handle_say_stop_disarms_always(monkeypatch, tmp_path):
+    import say_engine
+
+    monkeypatch.setattr(say_engine, "_hermes_home", lambda: tmp_path)
+    set_mode("always", tmp_path)
+    stop()
+    assert handle_say("stop") == "nothing playing."
+    assert get_mode(tmp_path) == "once"
+
+
 def test_handle_say_empty_history_reports(tmp_path, monkeypatch):
     import say_engine
 
