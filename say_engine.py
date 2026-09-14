@@ -145,11 +145,9 @@ def latest_assistant_texts(limit: int = 50, home: Path | None = None) -> list:
         return []
 
 
-USAGE = "usage: /say [text|number|stop] — bare /say reads the last reply"
+USAGE = "usage: /say [text|number|stop|always|once] — bare /say reads the last reply"
 
-RESTORE_TIP = "Tip: TUI patch missing since an update — `hermes speak-patch install`, rebuild, restart to restore Ctrl+S."
-
-MODE_FILE = "speak-aloud.mode"  # Shared with the TUI backend (speak.mode RPC reads/writes the same file).
+MODE_FILE = "speak-aloud.mode"  # Plugin-owned auto-read preference in Hermes home.
 MODES = ("once", "always")
 
 
@@ -176,37 +174,23 @@ def set_mode(mode: str, home=None) -> tuple:
     return mode, stopped
 
 
-def hermes_tree() -> Path | None:
-    """Installed Hermes source tree, or None when it can't be located."""
+def auto_speak_response(response: str | None, home=None, platform: str | None = None) -> bool:
+    """Best-effort speech for a finalized TUI response when auto mode is enabled."""
     try:
-        import hermes_constants
-
-        return Path(hermes_constants.__file__).resolve().parent
-    except Exception:
-        pass
-    fallback = Path.home() / ".hermes" / "hermes-agent"
-    return fallback if (fallback / "tui_gateway").is_dir() else None
-
-
-_CORE_MARKERS = (
-    ("tui_gateway/methods_voice.py", '@method("speak.say")'),
-    ("ui-tui/src/lib/platform.ts", "isSpeakAloudKey"),
-    ("ui-tui/src/app/useInputHandlers.ts", "toggleSpeakAloud"),
-)
-
-
-def core_patch_present(tree: Path | None = None) -> bool | None:
-    """True/False whether the TUI source patch is applied; None if unknown."""
-    try:
-        root = Path(tree) if tree is not None else hermes_tree()
-        if root is None:
-            return None
-        for rel, marker in _CORE_MARKERS:
-            if marker not in (root / rel).read_text():
-                return False
+        if platform != "tui":
+            return False
+        if get_mode(home) != "always":
+            return False
+        text = str(response or "").strip()
+        if not text:
+            return False
+        script = spoken_script(text)
+        if not script.strip():
+            return False
+        start(script)
         return True
     except Exception:
-        return None
+        return False
 
 
 def handle_say(raw_args: str | None) -> str:
@@ -220,16 +204,12 @@ def handle_say(raw_args: str | None) -> str:
             pass
         return "stopped." if silenced else "nothing playing."
     if arg.lower() in MODES:
-        # Seen only when the TUI tree patch is gone (it intercepts these words
-        # while present): save the preference into the shared mode file so auto
-        # read-aloud resumes after `hermes speak-patch install` + rebuild.
         try:
             set_mode(arg.lower())
         except Exception as e:
             return f"could not save auto-mode: {e}"
         if arg.lower() == "always":
-            return ("auto read-aloud noted — it needs the TUI patch to speak turns by itself: "
-                    "`hermes speak-patch install`, rebuild, restart. (Saved; takes effect once restored.)")
+            return "auto read-aloud ON — this plugin will speak future TUI replies. /say once to stop."
         return "auto read-aloud OFF — back to on-demand. (stopped.)"
     if sys.platform != "darwin":
         return "Apple read-aloud needs macOS (/usr/bin/say)."
@@ -245,7 +225,4 @@ def handle_say(raw_args: str | None) -> str:
         return "Apple 'say' not found — read-aloud needs macOS."
     except Exception as e:
         return f"read-aloud failed: {e}"
-    result = "speaking… (/say stop to stop)"
-    if core_patch_present() is False:
-        result += f"\n{RESTORE_TIP}"
-    return result
+    return "speaking… (/say stop to stop)"

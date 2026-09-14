@@ -1,14 +1,16 @@
 """Tests for the speak-aloud plugin engine (stdlib-only, no Hermes imports)."""
 
+import importlib.util
 import os
 import sqlite3
 import sys
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from say_engine import core_patch_present, get_mode, handle_say, latest_assistant_texts, resolve_text, set_mode, speaking, start, stop
+from say_engine import get_mode, handle_say, latest_assistant_texts, resolve_text, set_mode, speaking, start, stop
 
 
 def test_resolve_last_assistant_on_empty_arg():
@@ -123,58 +125,6 @@ def test_handle_say_empty_history_reports(tmp_path, monkeypatch):
     assert handle_say("") == "nothing to speak — start a conversation first"
 
 
-def _write_tree(root, with_markers=True):
-    (root / "tui_gateway").mkdir(parents=True, exist_ok=True)
-    (root / "ui-tui" / "src" / "lib").mkdir(parents=True, exist_ok=True)
-    (root / "ui-tui" / "src" / "app").mkdir(parents=True, exist_ok=True)
-    mark = "present" if with_markers else "absent"
-    (root / "tui_gateway" / "methods_voice.py").write_text(
-        '@method("speak.say")' if with_markers else "nothing here"
-    )
-    (root / "ui-tui" / "src" / "lib" / "platform.ts").write_text(
-        "isSpeakAloudKey" if with_markers else "nothing here"
-    )
-    (root / "ui-tui" / "src" / "app" / "useInputHandlers.ts").write_text(
-        "toggleSpeakAloud" if with_markers else "nothing here"
-    )
-    return mark
-
-
-def test_core_patch_present_true(tmp_path):
-    _write_tree(tmp_path, with_markers=True)
-    assert core_patch_present(tmp_path) is True
-
-
-def test_core_patch_present_false_when_marker_missing(tmp_path):
-    _write_tree(tmp_path, with_markers=True)
-    (tmp_path / "ui-tui" / "src" / "lib" / "platform.ts").write_text("nothing here")
-    assert core_patch_present(tmp_path) is False
-
-
-def test_core_patch_present_none_when_tree_missing(tmp_path):
-    assert core_patch_present(tmp_path / "nope") is None
-
-
-def test_handle_say_adds_restore_tip_when_patch_missing(monkeypatch):
-    import say_engine
-
-    monkeypatch.setattr(say_engine, "latest_assistant_texts", lambda *a, **k: ["hi there"])
-    monkeypatch.setattr(say_engine, "core_patch_present", lambda *a, **k: False)
-    monkeypatch.setattr(say_engine, "start", lambda *a, **k: 1234)
-    result = handle_say("hi there")
-    assert result.startswith("speaking…")
-    assert "hermes speak-patch install" in result
-
-
-def test_handle_say_no_tip_when_patch_present(monkeypatch):
-    import say_engine
-
-    monkeypatch.setattr(say_engine, "latest_assistant_texts", lambda *a, **k: ["hi there"])
-    monkeypatch.setattr(say_engine, "core_patch_present", lambda *a, **k: True)
-    monkeypatch.setattr(say_engine, "start", lambda *a, **k: 1234)
-    assert handle_say("hi there") == "speaking… (/say stop to stop)"
-
-
 def test_mode_round_trips_to_file(tmp_path):
     assert get_mode(tmp_path) == "once"
     assert set_mode("always", tmp_path) == ("always", False)
@@ -190,20 +140,166 @@ def test_mode_rejects_garbage(tmp_path):
         set_mode("sometimes", tmp_path)
 
 
-def test_handle_say_always_saves_preference(monkeypatch, tmp_path):
+def test_handle_say_always_enables_plugin_owned_tui_auto_reading(monkeypatch, tmp_path):
     import say_engine
 
     monkeypatch.setattr(say_engine, "_hermes_home", lambda: tmp_path)
     result = handle_say("always")
     assert get_mode(tmp_path) == "always"
-    assert "speak-patch install" in result
+    assert result == "auto read-aloud ON — this plugin will speak future TUI replies. /say once to stop."
 
 
-def test_handle_say_once_reverts_to_demand(monkeypatch, tmp_path):
+def test_handle_say_once_reverts_to_on_demand_and_stops_active_utterance(monkeypatch, tmp_path):
     import say_engine
 
     monkeypatch.setattr(say_engine, "_hermes_home", lambda: tmp_path)
     set_mode("always", tmp_path)
+    stops = []
+    monkeypatch.setattr(say_engine, "stop", lambda: stops.append(True) or True)
     result = handle_say("once")
+    assert stops == [True]
     assert get_mode(tmp_path) == "once"
-    assert "on-demand" in result
+    assert result == "auto read-aloud OFF — back to on-demand. (stopped.)"
+
+
+def test_auto_speak_starts_for_tui_final_response_when_mode_is_always(monkeypatch, tmp_path):
+    import say_engine
+
+    spoken = []
+    set_mode("always", tmp_path)
+    monkeypatch.setattr(say_engine, "spoken_script", lambda text: f"spoken: {text}")
+    monkeypatch.setattr(say_engine, "start", lambda text: spoken.append(text) or 1234)
+
+    assert say_engine.auto_speak_response("finished reply", home=tmp_path, platform="tui") is True
+    assert spoken == ["spoken: finished reply"]
+
+
+def test_auto_speak_stays_silent_when_mode_is_once(monkeypatch, tmp_path):
+    import say_engine
+
+    set_mode("once", tmp_path)
+    monkeypatch.setattr(
+        say_engine,
+        "start",
+        lambda text: (_ for _ in ()).throw(AssertionError("start must not be called")),
+    )
+
+    assert say_engine.auto_speak_response("finished reply", home=tmp_path, platform="tui") is False
+
+
+def test_auto_speak_stays_silent_for_blank_response(monkeypatch, tmp_path):
+    import say_engine
+
+    set_mode("always", tmp_path)
+    monkeypatch.setattr(
+        say_engine,
+        "start",
+        lambda text: (_ for _ in ()).throw(AssertionError("start must not be called")),
+    )
+
+    assert say_engine.auto_speak_response(" \n\t ", home=tmp_path, platform="tui") is False
+
+
+def test_auto_speak_swallows_audio_errors(monkeypatch, tmp_path):
+    import say_engine
+
+    set_mode("always", tmp_path)
+
+    def unavailable(_text):
+        raise OSError("say is unavailable")
+
+    monkeypatch.setattr(say_engine, "start", unavailable)
+
+    assert say_engine.auto_speak_response("finished reply", home=tmp_path, platform="tui") is False
+
+
+def test_auto_speak_stays_silent_outside_tui_when_mode_is_always(monkeypatch, tmp_path):
+    import say_engine
+
+    set_mode("always", tmp_path)
+    monkeypatch.setattr(
+        say_engine,
+        "start",
+        lambda text: (_ for _ in ()).throw(AssertionError("start must not be called")),
+    )
+
+    assert say_engine.auto_speak_response("finished reply", home=tmp_path, platform="cli") is False
+
+
+def _load_plugin_module():
+    spec = importlib.util.spec_from_file_location(
+        "speak_aloud_plugin_test", Path(__file__).with_name("__init__.py")
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _RecordingContext:
+    def __init__(self):
+        self.commands = []
+        self.cli_commands = []
+        self.hooks = {}
+
+    def register_command(self, **kwargs):
+        self.commands.append(kwargs)
+
+    def register_cli_command(self, **kwargs):
+        self.cli_commands.append(kwargs)
+
+    def register_hook(self, name, callback):
+        self.hooks[name] = callback
+
+
+def test_registers_only_say_slash_and_cli_commands():
+    context = _RecordingContext()
+
+    _load_plugin_module().register(context)
+
+    assert [command["name"] for command in context.commands] == ["say"]
+    assert [command["name"] for command in context.cli_commands] == ["say"]
+    assert set(context.hooks) == {"post_llm_call"}
+
+
+def test_post_llm_hook_forwards_tui_platform_to_auto_speech(monkeypatch):
+    import say_engine
+
+    calls = []
+
+    def record(response, *, platform):
+        calls.append((response, platform))
+
+    monkeypatch.setattr(say_engine, "auto_speak_response", record, raising=False)
+
+    context = _RecordingContext()
+    _load_plugin_module().register(context)
+
+    context.hooks["post_llm_call"](assistant_response="finished reply", platform="tui")
+
+    assert calls == [("finished reply", "tui")]
+
+
+@pytest.mark.parametrize(
+    "hook_kwargs",
+    [
+        {"platform": "cli"},
+        {"platform": "telegram"},
+        {"platform": "unknown"},
+        {"platform": None},
+        {},
+    ],
+    ids=["cli", "telegram", "unknown", "none", "absent"],
+)
+def test_post_llm_hook_stays_silent_outside_tui(monkeypatch, hook_kwargs):
+    import say_engine
+
+    calls = []
+    monkeypatch.setattr(say_engine, "auto_speak_response", lambda *args, **kwargs: calls.append((args, kwargs)), raising=False)
+
+    context = _RecordingContext()
+    _load_plugin_module().register(context)
+
+    context.hooks["post_llm_call"](assistant_response="finished reply", **hook_kwargs)
+
+    assert calls == []

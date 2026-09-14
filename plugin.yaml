@@ -1,4 +1,4 @@
 name: speak-aloud
-version: 1.2.0
-description: Apple-native read-aloud (/say) for Hermes on macOS via /usr/bin/say — no API keys. Survives Hermes updates (user-state plugin).
+version: 2.0.0
+description: Apple-native read-aloud (/say) for Hermes on macOS via /usr/bin/say — no API keys. Includes TUI-only automatic reply speech and survives Hermes updates as a user-state plugin.
 author: Hermes Agent
